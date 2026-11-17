@@ -24,6 +24,8 @@ except Exception:
     pass
 
 import cv2
+cv2.setNumThreads(1)
+from alert_guard import AlertGuard, reveal_reason
 import numpy as np
 import psutil
 import requests
@@ -82,7 +84,7 @@ def egg_image(fill, ring, px=64, glow=None):
     d.polygon(outline(0.0), fill=fill)
     return im.resize((px * 2, px * 2), Image.LANCZOS)
 
-APP_VERSION = "1.3.1"
+APP_VERSION = "2.5.0"
 # Where the app looks for new versions. Use ONE of:
 #   - a GitHub releases link:  "https://api.github.com/repos/YOUR-NAME/YOUR-REPO/releases/latest"
 #   - a link to a small JSON file you host:  {"version": "1.1.0", "url": "https://download-link", "notes": "what's new"}
@@ -727,7 +729,7 @@ class AccountCard(ctk.CTkFrame):
         self.tw = self.th = 0
         self.ci = None
         self.hot = self.sel = self.hovered = False
-        self.img = ctk.CTkLabel(self, text="Waiting for a picture…", text_color=FAINT, fg_color=STAGE,
+        self.img = ctk.CTkLabel(self, text="Previews disabled · Low CPU", text_color=FAINT, fg_color=STAGE,
                                 corner_radius=0, font=F(12))
         self.img.pack(padx=10, pady=(10, 0))
         top = ctk.CTkFrame(self, fg_color="transparent")
@@ -828,6 +830,7 @@ class WinState:
     def __init__(self, hwnd, pid, label):
         self.hwnd, self.pid, self.label = hwnd, pid, label
         self.watch, self.armed = True, True
+        self.alert_guard = AlertGuard()
         self.streak = 0
         self.last_peek = 0.0
         self.gone_since = None
@@ -878,10 +881,9 @@ class App(ctk.CTk):
         self._build_ui()
         self._sync()
         self.scan_windows()
-        self.after(700, self._tick)
+        self.after(2500, self._tick)
         self.after(4000, self._periodic_update_check)
         threading.Thread(target=self._worker, daemon=True).start()
-        threading.Thread(target=self._preview_worker, daemon=True).start()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log("Ready. Paste your Discord user ID, then press Start watching.")
 
@@ -1872,26 +1874,8 @@ class App(ctk.CTk):
             self._refresh_table()
 
     def _preview_worker(self):
-        """Keeps the card pictures fresh for windows the watcher isn't scanning right now."""
-        while not self.stop.is_set():
-            did = False
-            for st in list(self.states.values()):
-                if self.stop.is_set():
-                    break
-                if time.time() - st.thumb_t < 4.0:
-                    continue
-                try:
-                    if not win32gui.IsWindow(st.hwnd) or win32gui.IsIconic(st.hwnd):
-                        continue
-                    frame = snap_window(st.hwnd, allow_peek=False, full=False)
-                    if frame is not None and frame.size:
-                        st.thumb, st.thumb_t = make_thumb(frame), time.time()
-                        st.thumb_v += 1
-                except Exception:
-                    pass
-                did = True
-                time.sleep(0.4)
-            time.sleep(0.3 if did else 1.0)
+        """Automatic previews disabled to eliminate background capture."""
+        return
 
     # ----------------------------------------------------------- detection
     def _get_ocr(self):
@@ -1899,7 +1883,7 @@ class App(ctk.CTk):
             if self.ocr is None:
                 self.log("Loading text reader (first time only)…")
                 from rapidocr_onnxruntime import RapidOCR
-                self.ocr = RapidOCR()
+                self.ocr = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
             return self.ocr
 
     def _ocr_text(self, img, target_w):
@@ -1911,18 +1895,24 @@ class App(ctk.CTk):
         return " ".join(r[1] for r in result).strip() if result else ""
 
     def analyze(self, frame):
-        """Returns (hit, reason, text). Cheap black-egg check first, OCR only if that misses."""
-        if find_black_egg(frame):
-            return True, "secret", ""
+        """Read the complete popup banner and small reveal button independently."""
         img = Image.fromarray(frame)
-        text = self._ocr_text(img, 1600)
-        if is_reveal_text(text):
-            return True, "Hold to Reveal", text
         w, h = img.size
-        text2 = self._ocr_text(img.crop((int(w * .15), int(h * .6), int(w * .85), h)), 1500)
-        if is_reveal_text(text2):
-            return True, "Hold to Reveal", text2
-        return False, "", (text + " " + text2).strip()
+        regions = (
+            # The special-hatch banner spans almost the entire bottom edge.
+            (img.crop((0, int(h * .78), w, h)), 1280),
+            # Enlarge the small outlined button without scaling the whole scene.
+            (img.crop((int(w * .30), int(h * .72), int(w * .70), int(h * .91))), 800),
+            (img, 1280),  # fallback for alternate window shapes / UI placement
+        )
+        readings = []
+        for region, width in regions:
+            text = self._ocr_text(region, width)
+            readings.append(text)
+            reason = reveal_reason(text)
+            if reason:
+                return True, reason, text
+        return False, "", " ".join(readings).strip()
 
     def _worker(self):
         grabber = Grabber()
@@ -1936,13 +1926,22 @@ class App(ctk.CTk):
                     break
                 if not st.watch or st.hwnd not in self.states:
                     continue
+                scan_started = time.monotonic()
                 try:
                     self._check(st, grabber, self.settings)
                 except Exception as e:
                     st.hit, st.status = False, "Error: " + str(e)[:40]
+                if self.settings.get("low_cpu", True):
+                    # Yield at least as long as this check worked; avoid sustained busy scans.
+                    self.stop.wait(max(0.25, time.monotonic() - scan_started))
             time.sleep(self.settings["interval"])
 
     def _check(self, st, grabber, s):
+        # Do not capture/restore windows on passes where no OCR is scheduled.
+        # Immediate second-frame confirmation below bypasses this gate.
+        scan_gap = max(6.0 if s.get("low_cpu", True) else 3.0, s.get("interval", 1.0))
+        if time.time() - st.last_txt < scan_gap:
+            return
         if not win32gui.IsWindow(st.hwnd):
             return
         minimized = bool(win32gui.IsIconic(st.hwnd))
@@ -1956,89 +1955,62 @@ class App(ctk.CTk):
             st.last_peek = time.time()
         frame = grabber.capture(st.hwnd, "Auto", allow_peek=s["minimized"], full=s["fullsize"])
         if frame is None or frame.size == 0:
+            st.alert_guard.observe(None, time.monotonic())
             st.hit, st.status = False, "Can't capture this window"
             return
         tag = "(min) " if minimized else ("(big) " if small else "")
         peeked = minimized or small
         now = time.time()
         hit, why = False, ""
-        if now - st.thumb_t >= 2.0:
-            try:
-                st.thumb, st.thumb_t = make_thumb(frame), now
-                st.thumb_v += 1
-            except Exception:
-                pass
-
-        # 1) fast check every scan: the black secret silhouette
-        if find_black_egg(frame):
-            hit, why = True, "secret"
-            if not peeked:  # confirm on a fresh frame a moment later so one odd frame can't ping the channel
-                time.sleep(0.35)
-                f2 = grabber.capture(st.hwnd, "Auto", allow_peek=False, full=False)
-                if f2 is not None and f2.size:
-                    if find_black_egg(f2):
-                        frame = f2
-                    else:
-                        hit = False
-
-        # 2) cheap text check (bottom-middle only) every few seconds: the "Hold to Reveal!" button
-        if not hit and now - st.last_txt >= 3.0:
+        # Only fresh OCR observations advance confirmation or re-arming.
+        checked = False
+        if now - st.last_txt >= 3.0:
             st.last_txt = now
             try:
-                im = Image.fromarray(frame)
-                w, h = im.size
-                if is_reveal_text(self._ocr_text(im.crop((int(w * .2), int(h * .55), int(w * .8), h)), 1100)):
-                    hit, why = True, "Hold to Reveal"
+                hit, why, _ = self.analyze(frame)
+                checked = True
             except Exception:
-                pass
+                st.alert_guard.observe(None, time.monotonic())
+                st.status = "Text reader unavailable — alerts paused"
+                return
 
-        # 3) full-screen text read only every 20s, just to spot the Roblox disconnect screen
-        dc_checked = dc = False
-        if not hit and s["dc_warn"] and now - st.last_full >= 20.0:
-            st.last_full = now
+        if not checked:
+            return
+        send = st.alert_guard.observe(hit, time.monotonic(), s["rearm"])
+        if hit and st.alert_guard.armed and st.alert_guard.hits == 1:
+            # Confirm this account before moving through the rest of the queue.
+            st.hit, st.status = True, "Confirming reveal…"
+            started = time.monotonic()
+            if self.stop.wait(0.35):
+                return
+            if not self.running or not st.watch or self.states.get(st.hwnd) is not st:
+                return
             try:
-                dc = is_disconnect_text(self._ocr_text(Image.fromarray(frame), 1280))
-                dc_checked = True
+                fresh = grabber.capture(st.hwnd, "Auto", allow_peek=s["minimized"], full=s["fullsize"])
+                if fresh is None or fresh.size == 0:
+                    st.alert_guard.observe(None, time.monotonic())
+                    st.hit, st.status = False, "Confirmation capture unavailable"
+                    return
+                hit, why, _ = self.analyze(fresh)
+                frame = fresh
+                send = st.alert_guard.observe(hit, time.monotonic(), s["rearm"])
+                self.log(f"{st.label}: confirmation {'matched' if hit else 'cleared'} in {time.monotonic() - started:.1f}s.")
             except Exception:
-                pass
-        if dc_checked:
-            if dc:
-                st.dc_streak += 1
-                st.dc_clear = 0
-                if st.dc_streak >= 2 and not st.dc_sent and self.running:
-                    st.dc_sent = True  # one warning per disconnect, re-arms once the error screen is gone
-                    threading.Thread(target=self._send_warning,
-                                     args=(st.label, "looks disconnected (Roblox error screen)", frame, dict(s)),
-                                     daemon=True).start()
-            else:
-                st.dc_streak = 0
-                st.dc_clear += 1
-                if st.dc_clear >= 2:
-                    st.dc_sent = False
-
+                st.alert_guard.observe(None, time.monotonic())
+                st.hit, st.status = False, "Confirmation reader unavailable"
+                return
         st.hit = hit
         if hit:
-            st.status = tag + f"SECRET SCREEN! ({why})"
-        elif st.dc_streak >= 2:
-            st.status = tag + "DISCONNECTED? (Roblox error screen)"
+            st.status = tag + ("Confirmed · alert sent" if send else
+                               "Confirming reveal…" if st.alert_guard.hits < 2 else "Reveal visible · duplicate blocked")
         else:
-            st.status = tag + "Watching"
-
-        if hit:
-            st.gone_since = None
-            if st.armed:  # one alert per secret: fire once, then stay quiet until it has been gone for a while
-                st.armed = False
-                self.log(f"{st.label}: SECRET detected ({why}). Sending to Discord…")
-                if s.get("sound_alert", True):
-                    play_sound()
-                counts = self.record_hatch(st.label)
-                threading.Thread(target=self._send_alert, args=(st, frame, s, False, counts), daemon=True).start()
-        else:
-            if st.gone_since is None:
-                st.gone_since = time.time()
-            elif not st.armed and time.time() - st.gone_since >= s["rearm"]:
-                st.armed = True  # gone long enough: the next one counts as a new secret
-                self.log(f"{st.label}: ready for the next secret.")
+            st.status = tag + "Scanning · text confirmation on"
+        if send and self.running and st.watch and self.states.get(st.hwnd) is st:
+            self.log(f"{st.label}: reveal confirmed on consecutive scans. Sending alert…")
+            if s.get("sound_alert", True):
+                play_sound()
+            counts = self.record_hatch(st.label)
+            threading.Thread(target=self._send_alert, args=(st, frame, dict(s), False, counts), daemon=True).start()
 
     # ------------------------------------------------------- notifications
     def _send_alert(self, st, frame, s, is_test, counts=None):
@@ -2082,23 +2054,7 @@ class App(ctk.CTk):
             self.log(f"Reveal picture failed for {label}: {e}")
 
     def _send_warning(self, label, reason, frame=None, s=None):
-        s = s or self.settings
-        uid = s["discord_id"]
-        if not ID_RE.match(uid or ""):
-            return
-        embed = {"title": "⚠️ Account needs attention", "description": f"Account: **{label}**\n{reason}",
-                 "color": 0xE5484D, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-        img = None
-        if frame is not None and getattr(frame, "size", 0):
-            embed["image"] = {"url": "attachment://secret.jpg"}
-            img = to_jpeg_bytes(frame)
-        try:
-            post_discord({"username": "Secret Hatch Notifer+", "content": f"<@{uid}> ⚠️ **{label}** {reason}",
-                          "embeds": [embed]}, img, ping_id=uid)
-            self.dc_count += 1
-            self.log(f"Warning sent: {label} {reason}")
-        except Exception as e:
-            self.log(f"Warning failed for {label}: {e}")
+        return  # Disconnect notifications remain disabled.
 
     def on_test_alert(self):
         if not self._valid_id():
@@ -2144,90 +2100,7 @@ class App(ctk.CTk):
         return ctk.CTkImage(light_image=im, dark_image=im, size=(max(1, int(im.width * sc)), max(1, int(im.height * sc))))
 
     def on_view(self):
-        """Live preview of what the watcher sees for the selected account. Local only, nothing is sent."""
-        st = self._pick()
-        if st is None:
-            self.log("Click an account first, then open its live view.")
-            return
-        win = self._popup(f"Live view: {st.label}", 880, 640)
-        stage = ctk.CTkLabel(win, text="Loading…", text_color=FAINT, fg_color=STAGE, corner_radius=0,
-                             width=840, height=472, font=F(13))
-        stage.pack(padx=20, pady=(20, 14))
-        info = ctk.CTkLabel(win, text="", text_color=MUTED, fg_color=PANEL2, corner_radius=12, height=30, font=F(13, True))
-        info.pack()
-        sub = ctk.CTkLabel(win, text="", text_color=MUTED, font=F(12))
-        sub.pack(pady=(10, 0))
-        ctk.CTkLabel(win, text="This picture stays on your PC. Nothing here is sent to Discord.", text_color=FAINT,
-                     font=F(12)).pack(pady=(2, 14))
-        shared = {"on": True, "v": 0, "data": (None, None, "")}
-        seen = {"v": 0}
-        last = {"t": 0.0, "f": None}
-
-        def closed(_e=None):
-            shared["on"] = False
-        win.bind("<Destroy>", lambda e: closed() if e.widget is win else None)
-
-        def chip(text, color):
-            info.configure(text=f"   ●  {text}   ", text_color=color, fg_color=CHIP_BG.get(color, PANEL2))
-
-        def push(frame, egg, note):
-            if frame is not None:
-                ci = self._fit(frame, 840, 472)
-                stage.configure(image=ci, text="")
-                stage.image = ci
-                if egg:
-                    chip("Secret detected", GOLD)
-                else:
-                    chip("No secret on screen", GREEN)
-                where = "Minimized, so the picture refreshes every few seconds.   " if note == "minimized" else ""
-                sub.configure(text=where + ("Alerts are ready." if st.armed else "Waiting for the egg to clear before "
-                                                                                 "the next alert.")
-                                   + ("" if self.running else "   Watching is stopped."))
-            else:
-                stage.configure(image=None, text=note)
-                chip("No picture", MUTED)
-                sub.configure(text="")
-
-        def paint():  # runs on the window's own timer, so the capture thread never touches the UI
-            if not shared["on"] or not win.winfo_exists():
-                return
-            if shared["v"] != seen["v"]:
-                seen["v"] = shared["v"]
-                push(*shared["data"])
-            win.after(150, paint)
-
-        def loop():
-            while shared["on"] and not self.stop.is_set():
-                frame = egg = None
-                note = ""
-                try:
-                    if not win32gui.IsWindow(st.hwnd):
-                        note = "This Roblox window was closed."
-                    elif win32gui.IsIconic(st.hwnd):
-                        if not self.settings["minimized"]:
-                            note = "This window is minimized and “Watch minimized windows” is off."
-                        elif time.time() - last["t"] >= self.settings["peek"]:
-                            last["t"] = time.time()
-                            last["f"] = snap_window(st.hwnd, allow_peek=True, full=self.settings["fullsize"])
-                        frame = last["f"] if not note else None
-                        if frame is not None and frame.size:
-                            egg = find_black_egg(frame)
-                            note = "minimized"
-                        elif not note:
-                            frame, note = None, "Minimized: waiting for the next check…"
-                    else:
-                        frame = snap_window(st.hwnd, allow_peek=False, full=False)
-                        if frame is not None and frame.size:
-                            egg = find_black_egg(frame)
-                        else:
-                            frame, note = None, "Can't capture this window right now."
-                except Exception as e:
-                    frame, note = None, f"Capture error: {str(e)[:60]}"
-                shared["data"] = (frame, egg, note)
-                shared["v"] += 1
-                time.sleep(1.0)
-        threading.Thread(target=loop, daemon=True).start()
-        win.after(150, paint)
+        messagebox.showinfo("Previews disabled", "Live previews are disabled to reduce CPU usage. Use Bring to front to view Roblox. Detection continues while watching is enabled.")
 
     def on_test_read(self):
         st = self._selected()
@@ -2268,10 +2141,10 @@ class App(ctk.CTk):
             self.scan_windows()
         else:
             self._refresh_table()
-        if self._tick_n % 3 == 0:
+        if self.page == "stats" and self.state() != "iconic":
             self.refresh_stats()
         self._drain()
-        self.after(700, self._tick)
+        self.after(2500, self._tick)
 
     # --------------------------------------------------------------- updates
     def check_updates(self, manual=False):
@@ -2292,6 +2165,8 @@ class App(ctk.CTk):
         threading.Thread(target=run, daemon=True).start()
 
     def _show_update(self, ver, url, notes, asset):
+        if parse_version(ver) <= parse_version(APP_VERSION):
+            return
         self.update_info = (ver, url, notes, asset)
         label = ver if ver.lower().startswith("v") else "v" + ver
         self.update_btn.configure(text=f"⬆  Update to {label}", state="normal")
@@ -2305,6 +2180,8 @@ class App(ctk.CTk):
         if not self.update_info or self._updating:
             return
         ver, url, notes, asset = self.update_info
+        if parse_version(ver) <= parse_version(APP_VERSION):
+            return
         label = ver if ver.lower().startswith("v") else "v" + ver
         installed = bool(getattr(sys, "frozen", False))
         if not (installed and asset.startswith("https://")):
