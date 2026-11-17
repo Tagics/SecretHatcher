@@ -1,3 +1,7 @@
+# 2.5.1 — Windows build fix
+
+Read the source as UTF-8 during release validation so Unicode UI text does not break the Windows build. Includes the redesigned UI and disabled previews from 2.5.0.
+
 # 2.5.0 — New UI with reduced background work
 
 Based on ui-redesign / v2.3.4. Preserves the new UI; corrects its embedded 1.3.1 version to 2.5.0. The build rejects mismatched version tags and publishes successful artifacts as latest. Update dialogs and installation recheck version order.

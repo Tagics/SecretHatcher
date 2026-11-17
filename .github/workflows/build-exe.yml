@@ -25,7 +25,7 @@ jobs:
           python-version: "3.12"
       - name: Verify release version
         shell: bash
-        run: python -c "import ast, os, pathlib; t=ast.parse(pathlib.Path('hatch_watcher.py').read_text()); v=next(ast.literal_eval(n.value) for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='APP_VERSION' for x in n.targets)); assert os.environ['TAG']=='v'+v, 'Release tag and APP_VERSION must match'"
+        run: python -c "import ast, os, pathlib; t=ast.parse(pathlib.Path('hatch_watcher.py').read_text(encoding='utf-8')); v=next(ast.literal_eval(n.value) for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id=='APP_VERSION' for x in n.targets)); assert os.environ['TAG']=='v'+v, 'Release tag and APP_VERSION must match'"
       - name: Install requirements
         run: python -m pip install -r requirements.txt pyinstaller
       - name: Add webhooks from GitHub secrets
