@@ -1,3 +1,7 @@
+# 2.5.2 — Release retry
+
+Rebuild the new UI and CPU fixes after configuring the cross-repository release token.
+
 # 2.5.1 — Windows build fix
 
 Read the source as UTF-8 during release validation so Unicode UI text does not break the Windows build. Includes the redesigned UI and disabled previews from 2.5.0.

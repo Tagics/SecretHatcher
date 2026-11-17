@@ -84,7 +84,7 @@ def egg_image(fill, ring, px=64, glow=None):
     d.polygon(outline(0.0), fill=fill)
     return im.resize((px * 2, px * 2), Image.LANCZOS)
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 # Where the app looks for new versions. Use ONE of:
 #   - a GitHub releases link:  "https://api.github.com/repos/YOUR-NAME/YOUR-REPO/releases/latest"
 #   - a link to a small JSON file you host:  {"version": "1.1.0", "url": "https://download-link", "notes": "what's new"}
